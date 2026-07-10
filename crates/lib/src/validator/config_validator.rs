@@ -2,7 +2,9 @@ use std::{collections::HashSet, path::Path, str::FromStr};
 
 use crate::{
     admin::token_util::find_missing_atas,
-    config::{FeePayerPolicy, SplTokenConfig, Token2022Config, TransferHookPolicy},
+    config::{
+        FeePayerPolicy, SplTokenConfig, Token2022Config, TransferHookPolicy, ValidationConfig,
+    },
     constant::{
         BPF_LOADER_UPGRADEABLE_PROGRAM_ID, LIGHTHOUSE_PROGRAM_ID, LOADER_V4_PROGRAM_ID,
         MAX_RECAPTCHA_SCORE, MIN_RECAPTCHA_SCORE, STAKE_PROGRAM_ID, VOTE_PROGRAM_ID,
@@ -484,6 +486,24 @@ impl ConfigValidator {
         }
     }
 
+    fn warn_mutable_transfer_hook_payment_risk(
+        validation: &ValidationConfig,
+        warnings: &mut Vec<String>,
+    ) {
+        let allows_immediate_mutable_hook =
+            !matches!(validation.token_2022.transfer_hook_policy, TransferHookPolicy::DenyAll);
+        if allows_immediate_mutable_hook && validation.is_payment_required() {
+            warnings.push(
+                "⚠️  SECURITY: transfer_hook_policy allows mutable Token-2022 transfer hooks on \
+                immediate signAndSend. A payment mint with a mutable transfer hook can refund \
+                Kora's payment after validation but before execution, leaving zero net payment. \
+                Use transfer_hook_policy = \"deny_all\", or only accept payment mints with \
+                immutable transfer hooks."
+                    .to_string(),
+            );
+        }
+    }
+
     pub async fn validate(_rpc_client: &RpcClient) -> Result<(), KoraError> {
         let config = &get_config()?;
 
@@ -819,6 +839,8 @@ impl ConfigValidator {
         // Validate fee payer policy - warn about enabled risky operations
         Self::validate_fee_payer_policy(&config.validation.fee_payer_policy, &mut warnings);
 
+        Self::warn_mutable_transfer_hook_payment_risk(&config.validation, &mut warnings);
+
         // Validate margin (error if negative)
         match &config.validation.price.model {
             PriceModel::Fixed { amount, token, strict } => {
@@ -879,6 +901,14 @@ impl ConfigValidator {
         // Validate usage limit configuration
         let usage_config = &config.kora.usage_limit;
         if usage_config.enabled {
+            if usage_config.rules.is_empty() {
+                errors.push(
+                    "usage_limit.enabled is true but no rules are configured; add at least one \
+                     [[kora.usage_limit.rules]] or set enabled = false"
+                        .to_string(),
+                );
+            }
+
             let (usage_errors, usage_warnings) = CacheValidator::validate(usage_config).await;
             errors.extend(usage_errors);
             warnings.extend(usage_warnings);
@@ -1190,6 +1220,106 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(!warnings.iter().any(|w| w.contains("PermanentDelegate")));
         assert!(warnings.iter().any(|w| w.contains("No authentication configured")));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_validate_rejects_usage_limit_enabled_without_rules() {
+        std::env::set_var("JUPITER_API_KEY", "test-api-key");
+        let config = Config {
+            validation: ValidationConfig {
+                max_allowed_lamports: 1_000_000,
+                max_signatures: 10,
+                allowed_programs: ProgramsConfig::Allowlist(vec![
+                    SYSTEM_PROGRAM_ID.to_string(),
+                    SPL_TOKEN_PROGRAM_ID.to_string(),
+                ]),
+                allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
+                allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
+                    "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
+                ]),
+                disallowed_accounts: vec![],
+                price_source: PriceSource::Jupiter,
+                fee_payer_policy: FeePayerPolicy::default(),
+                price: PriceConfig::default(),
+                token_2022: Token2022Config::default(),
+                allow_durable_transactions: false,
+                max_price_staleness_slots: 0,
+                require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
+            },
+            kora: KoraConfig {
+                usage_limit: UsageLimitConfig {
+                    enabled: true,
+                    cache_url: None,
+                    fallback_if_unavailable: true,
+                    rules: vec![],
+                },
+                ..KoraConfig::default()
+            },
+            metrics: MetricsConfig::default(),
+        };
+
+        let _ = update_config(config);
+
+        let rpc_client = RpcClient::new_with_commitment(
+            "http://localhost:8899".to_string(),
+            CommitmentConfig::confirmed(),
+        );
+        let result = ConfigValidator::validate_with_result(&rpc_client, true).await;
+        let errors = result.expect_err("enabled usage_limit with no rules must fail validation");
+        assert!(errors.iter().any(|e| e.contains("no rules are configured")));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_validate_allows_usage_limit_disabled_without_rules() {
+        std::env::set_var("JUPITER_API_KEY", "test-api-key");
+        let config = Config {
+            validation: ValidationConfig {
+                max_allowed_lamports: 1_000_000,
+                max_signatures: 10,
+                allowed_programs: ProgramsConfig::Allowlist(vec![
+                    SYSTEM_PROGRAM_ID.to_string(),
+                    SPL_TOKEN_PROGRAM_ID.to_string(),
+                ]),
+                allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
+                allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
+                    "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
+                ]),
+                disallowed_accounts: vec![],
+                price_source: PriceSource::Jupiter,
+                fee_payer_policy: FeePayerPolicy::default(),
+                price: PriceConfig::default(),
+                token_2022: Token2022Config::default(),
+                allow_durable_transactions: false,
+                max_price_staleness_slots: 0,
+                require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
+            },
+            kora: KoraConfig {
+                usage_limit: UsageLimitConfig {
+                    enabled: false,
+                    cache_url: None,
+                    fallback_if_unavailable: true,
+                    rules: vec![],
+                },
+                ..KoraConfig::default()
+            },
+            metrics: MetricsConfig::default(),
+        };
+
+        let _ = update_config(config);
+
+        let rpc_client = RpcClient::new_with_commitment(
+            "http://localhost:8899".to_string(),
+            CommitmentConfig::confirmed(),
+        );
+        let result = ConfigValidator::validate_with_result(&rpc_client, true).await;
+        let warnings = result.expect("disabled usage_limit with no rules must pass validation");
+        assert!(!warnings.iter().any(|w| w.contains("no rules are configured")));
     }
 
     #[tokio::test]
@@ -3080,6 +3210,39 @@ mod tests {
         let mut warnings = Vec::new();
         ConfigValidator::warn_unvalidated_programs(&allowed, &mut warnings);
         assert!(warnings.is_empty(), "Expected no warnings for known programs, got: {warnings:?}");
+    }
+
+    #[test]
+    fn test_warn_mutable_transfer_hook_payment_risk() {
+        use crate::{fee::price::PriceModel, tests::config_mock::ConfigMockBuilder};
+
+        let build = |policy: TransferHookPolicy, model: PriceModel| {
+            let mut config = ConfigMockBuilder::new().build();
+            config.validation.token_2022.transfer_hook_policy = policy;
+            config.validation.price.model = model;
+            config
+        };
+
+        // Paid pricing + policy that allows immediate-send mutable hooks -> warning.
+        let config = build(
+            TransferHookPolicy::DenyMutableForDelayedSigning,
+            PriceModel::Margin { margin: 0.0 },
+        );
+        let mut warnings = Vec::new();
+        ConfigValidator::warn_mutable_transfer_hook_payment_risk(&config.validation, &mut warnings);
+        assert!(warnings.iter().any(|w| w.contains("mutable Token-2022 transfer hooks")));
+
+        // DenyAll -> no warning.
+        let config = build(TransferHookPolicy::DenyAll, PriceModel::Margin { margin: 0.0 });
+        let mut warnings = Vec::new();
+        ConfigValidator::warn_mutable_transfer_hook_payment_risk(&config.validation, &mut warnings);
+        assert!(warnings.is_empty());
+
+        // Free pricing -> no warning even if the policy would allow mutable hooks.
+        let config = build(TransferHookPolicy::AllowAll, PriceModel::Free);
+        let mut warnings = Vec::new();
+        ConfigValidator::warn_mutable_transfer_hook_payment_risk(&config.validation, &mut warnings);
+        assert!(warnings.is_empty());
     }
 
     #[test]
